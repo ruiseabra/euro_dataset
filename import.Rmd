@@ -1,0 +1,818 @@
+---
+title:  "Import robolimpet data from the European Network"
+author: "RS, 2018 MAR"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# SETUP
+## initialize
+Load libraries, set timezone and grab the path where all relevant data is stored (logger reports, logger details, etc.).
+```{r get_ready1}
+libraries <- c("xts", "tidyverse", "stringr", "lubridate", "fields", "sp", "maptools")
+```
+```{r get_ready2, echo = FALSE}
+for(l in libraries) suppressMessages(library(l, character.only = TRUE))
+
+Sys.setenv(TZ = "UTC") 
+.t0 <- .t1 <- Sys.time()
+
+path <- dirname(getwd())
+```
+The working directory is: `r path`  
+
+## options and context
+Set options that determine key aspects of how data is imported:  
+
+* whether or not to do a clean import (i.e., discard steps that were previously saved steps because they take a long time)  
+* final sampling rate (used for the interpolation of data to a uniform sample rate)   
+* variables related to the computing of water temperature  
+
+```{r opt}
+opt <- list()
+
+opt$CLEAN_IMPORT <- FALSE # if TRUE, previously saved robolimpet and tide data will be deleted and re-imported from scratch 
+
+opt$samp_rate   <- 3600 # sampling rate (in seconds) for data interpolation
+opt$tide_window <- 3    # water temperature # number of hours around tide to grab data from (3 = -1h, 0, +1h)
+opt$ref_max_sd  <- 0.8  # reference water temperature # maximum sd allowed betweenloggers
+opt$wat_max_sd  <- 0.5  # water temperature # maximum sd allowed between microhabitats, if more discard
+
+# `ref_quantiles` is used to filter tide data during the extraction of reference water temperatures, so that only the highest high tides are used to extract water temperatures from loggers higher in the intertidal (using 1 eliminates the use of that microhabitat)
+opt$ref_quantiles <- list(lsh = 0, lsu = 0, msh = 0.5, msu = 0.5, tsh = 0.75, tsu = 0.75, ssh = 1, ssu = 1)
+# `wat_quantiles` is used for the same process, but for final water temperatures
+opt$wat_quantiles <- list(lsh = 0, lsu = 0, msh = 0.5, msu = 0.5, tsh = 1, tsu = 1, ssh = 1, ssu = 1)
+
+opt$bias_factory_calib_weight <- 10 # how much more do temperatures recorded by loggers that retained factory calibration are valued when computing reference water temperatures for each shore
+
+opt$folders     <- lapply(list(
+  base       = "", 
+  reports    = "robolimpet_reports/", 
+  oldbias    = "logger_info/robolimpet_bias_old.RData", 
+  loggerInfo = "logger_info/robolimpet_info.RData",
+  data       = "logger_info/robolimpet_data.RData",
+  servDates  = "logger_info/robolimpet_servicing_dates.RData",
+  output     = "RData/euro_output.RData"
+  ), function(x) paste(path, x, sep="/"))
+opt$folders$imported_reports <- str_c(getwd(), "/RData/imported_reports.RData")
+opt$folders$imported_tides   <- str_c(getwd(), "/RData/imported_tides.RData")
+```
+
+Initialize main objects:  
+
+* `SHORES`  holds information pertaining to each shore  
+* `MICROS`  holds information specific to each shore-microhabitat combination  
+* `SERIALS` holds information specific to each logger (each unique serial; this object will be initialized later)  
+
+And compile information about the shores analysed:  
+
+* shore names, lat, lon, height, exposure and microhabitat  
+* colors for ploting  
+
+
+```{r info, echo = FALSE}
+SHORES <- tibble(
+  sh    = c("ev", "al", "sl", "mi", "mo", "to", "lc", "sv", "bi", "rn", "cc", "lz", "wy", "mc", "an", "em", "sc"),
+  shore = c("evaristo", "alteirinhos", "slourenco", "mindelo", "moledo", "tourinan", "lacaridad", "svbarquera", "biarritz", "royan", "lecroisic", "landunvez", "wembury", "mcastle", "anglesey", "emlagh", "scairn"), 
+  lat   = c(37.0742, 37.5192, 39.0135, 41.3104, 41.8399, 43.0429, 43.5654, 43.3936, 43.4844, 45.6256, 47.2899, 48.5431, 50.3134, 52.1249, 53.3194, 53.7511, 54.9721),
+  lon   = c(-8.3037, -8.8126, -9.4224, -8.7424, -8.8751, -9.29, -6.8281, -4.4403, -1.5632, -1.0626, -2.5424, -4.7514, -4.1071, -10.11, -4.6616, -9.9067, -5.1796))
+
+MICROS <- tibble(
+  height = rep(c("supra", "top", "mid", "low"), each = 2),
+  solar  = rep(c("sun", "shade"), 4),
+  micro  = str_c(str_sub(height, 1, 1), str_sub(solar, 1, 2)))
+
+# colors
+col <- list()
+col$shores          <- rev(tim.colors(nrow(SHORES)))
+names(col$shores)   <- SHORES$sh
+col$height          <- rep(c("black", "red", "yellow", "blue"), each = 2)
+names(col$height)   <- MICROS$height
+col$solar           <- rep(c("red", "blue"), 4)
+names(col$solar)    <- MICROS$solar
+col$micro           <- c("pink", "cyan", "red", "green", "orange", "lightblue", "yellow", "blue")
+names(col$micro)    <- MICROS$micro
+
+MICROS <- tibble(
+  sh     = rep(SHORES$sh,     each = nrow(MICROS)),
+  shore  = rep(SHORES$shore,  each = nrow(MICROS)),
+  lat    = rep(SHORES$lat,    each = nrow(MICROS)),
+  lon    = rep(SHORES$lon,    each = nrow(MICROS)),
+  height = rep(MICROS$height, nrow(SHORES)),
+  solar  = rep(MICROS$solar,  nrow(SHORES)),
+  micro  = rep(MICROS$micro,  nrow(SHORES)))
+MICROS$sh_mic <- str_c(MICROS$shore, "_", MICROS$micro)
+
+MICROS$col_shores <- col$shores[MICROS$sh]
+MICROS$col_micros <- col$micro[MICROS$micro]
+
+SHORES$col_shores <- col$shores[SHORES$sh]
+
+# map with all shores
+ggplot() + 
+  borders("world", fill = "gray80") + 
+  coord_fixed(1, xlim = c(-40,15), ylim = c(25, 65)) + 
+  labs(x = "", y = "", title = str_c("location of the ", nrow(SHORES), " shores")) + 
+  geom_point(data = SHORES, aes(x = lon, y = lat), color = SHORES$col_shores) +
+  theme_void()
+```
+
+## load previous info
+### servicing dates
+Load the dates of servicing fieldtrips. This is to be used in the `check for false starts` section.   
+obs: *compiled using the post-fieldwork processing routine*
+```{r previous_info1}
+load(opt$folders$servDates)
+(opt$servDates <- x)
+```
+
+### logger info
+Load logger info (serials, file paths, microhabitat details, etc). This is an `R` object that has all the details relating to every single logger report.    
+obs: *compiled using the post-fieldwork processing routine*
+```{r previous_info2_1}
+load(opt$folders$loggerInfo)
+(REPORTS <- x)
+```
+```{r previous_info2_2, echo = FALSE}
+rm(list = setdiff(ls(), c("SERIALS", "MICROS", "SHORES", "REPORTS", "reports", "opt")))
+```
+
+### bias details
+Load old values of bias correction for comparing with the new bias correction values obtained automatically.
+```{r previous_info3}
+load(opt$folders$oldbias)
+opt$bias_old <- x
+```
+
+# IMPORT
+Read all robolimpet report files, apply corrections and tidy data. The result is a tibble with one entry per logger serial, containing several details and the thermal profile (with calibration applied, and automated bias correction).
+
+## read each file
+Read each individual robolimpet report file and gather data.
+```{r read_files1}
+reimport <- TRUE
+if(!opt$CLEAN_IMPORT & file.exists(opt$folders$imported_reports)) {
+  load(opt$folders$imported_reports)
+  
+  # if the length of the data previously imported and the number of reports that need to be imported does match, it is assumed that there has been no change to the underlying data, and so import of robolimpet reports is skipped (it takes several minutes)
+  if(length(reports) == nrow(REPORTS)) reimport <- FALSE
+}
+
+if(reimport) {
+  # read each robolimpet report
+  reports  <- list()
+  pb <- txtProgressBar(max = nrow(REPORTS), style = 3)
+  for(i in 1:nrow(REPORTS)) {
+    x <- REPORTS[i,]
+    path   <- str_c(opt$folders$reports, x$file)
+    tdelta <- read_lines(path, skip = 1, n_max = 1)
+    tdelta <- if(tdelta == "NA") 0 else as.numeric(tdelta)
+    dat    <- suppressMessages(read_csv(path, col_names = FALSE, skip = 2))
+    colnames(dat) <- c("time", "temp")
+    if(first(dat$time) > last(dat$time)) dat <- dat[nrow(dat):1,]
+    if(any(is.na(tdelta))) stop()
+    reports[[i]] <- list(dat = dat, tdelta = tdelta, details = as.list(x))
+    setTxtProgressBar(pb, i)
+  }
+  save(reports, file = opt$folders$imported_reports)
+}
+```
+```{r read_files2, echo = FALSE}
+round(Sys.time() - .t1, 1)
+
+ggplot(reports[[1]]$dat) +
+  geom_line(aes(time, temp)) +
+  theme_void() +
+  labs(title = str_c("Last time logger data was imported: ", file.info(opt$folders$imported_reports)$ctime))
+```
+
+## apply calibration
+Apply a correction to the `r length(data)` files imported, based on the post-assembly calibration procedure: 
+
+* after assembly, loggers are placed at three different reference temperatures, and their bias at each step is recorded and used to implement a 3-point quadratic correction
+* correction is skipped for loggers without contacts
+```{r calibration}
+calibrate <- function(report) {
+  dat <- report$dat
+  x   <- report$details
+
+  if(x$contacts) {
+    missing_cal <- !x$factory_calib & length(unlist(x$calib)) == 1
+    if(missing_cal) stop("file missing calib data")
+    if(!missing_cal) {
+      lo_ref  <- x$lo_ref
+      md_ref  <- x$md_ref
+      hi_ref  <- x$hi_ref
+      
+      lo_read <- x$lo_read
+      md_read <- x$md_read
+      hi_read <- x$hi_read
+      
+      # calculate differences between chamber and logger measurements (from calibration data)
+      D_lo  <- lo_read - lo_ref
+      D_md  <- md_read - md_ref
+      D_hi  <- hi_read - hi_ref
+      
+      # calculate quadratic function parameters
+      Alpha <- (D_lo - D_hi) + ((D_md - D_lo) * (hi_ref - lo_ref)) / (md_ref - lo_ref)
+      Beta  <- hi_ref^2 - (md_ref * hi_ref) + (md_ref * lo_ref) - (hi_ref * lo_ref)
+      C     <- -Alpha / Beta
+      B     <- (D_md - D_lo - C * ((md_ref^2) - (lo_ref^2))) / (md_ref - lo_ref)  
+      A     <- D_lo - B * lo_ref - C * lo_ref^2
+      
+      # adjust readings with quadratic function
+      dat$temp <- round(dat$temp - A - B * dat$temp - C * dat$temp^2, 3)
+    }
+  }
+  dat
+}
+for(i in 1:length(reports)) reports[[i]]$dat <- calibrate(reports[[i]])
+```
+
+## adjust for clock drift
+Loggers' internal clocks (RTCs) drift with time, and drifting is affected by several aspects, primarily ambient temperature. Since the time diference between the RTC and a reference clock (PC or NS71) is stored with each report file, that diference is used to stretch or shrink the time span of the data accordingly.  
+
+### fix false starts
+But first, sometimes a logger was not serviced during the previous servicing fieldwork, and when later recovered it contains data that must be time-adjusted and trimmed taking into account a different set of work dates. If that is the case, fix `tdelta` and `reports[[i]]$details$start`.
+```{r false_start}
+for(i in 1:length(reports)) {
+  dat    <- reports[[i]]$dat
+  x      <- reports[[i]]$details
+  tdelta <- reports[[i]]$tdelta
+  t0     <- first(dat$time)
+  
+  # check if the logger has been started during the previous filedwork, which is indicative of it having been 'not-serviced'
+  startDiff <- difftime(t0, x$start, units = "days")
+  if(x$contacts & startDiff < -15) {
+    tmp      <- filter(opt$servDates, long == x$shore2)$servDates[[1]]
+    diffs    <- difftime(tmp, t0, units = "days")
+    newStart <- tmp[which(diffs > -20 & diffs < 2)]
+    # sometimes there has been servicing work in consecutive days, and so more than one servicing date may fall within the selected range; in that case, to be conservative, the oldest servicing time is selected
+    if(length(newStart) > 1) newStart <- max(newStart)
+    # sometimes the new date seleted is slightly earlier than the first data entry (due to the dificulty in correctly selecting the newStart date in the prvious step); this is fixed by taking the first timestamp of the data, and setting newStart to begining of the next day
+    if(t0 > newStart) newStart <- as.POSIXct(str_sub(t0, 1, 10)) + 3600 * 24
+    if(difftime(t0, newStart, units = "days") < 4) {
+      # compute a new tdelta trying to discard the excess drift that was accumulated after the memory became full
+      reports[[i]]$tdelta <- floor((as.numeric(difftime(x$end, x$start, units = "secs")) * tdelta) / as.numeric(difftime(x$end, newStart, units = "secs")))
+      # save a new tstart so that the data is trimed properly
+      reports[[i]]$details$start <- newStart
+    }
+  }
+}
+```
+
+### fix clock drift
+```{r clock_drift}
+for(i in 1:length(reports)) {
+  dat    <- reports[[i]]$dat
+  tdelta <- reports[[i]]$tdelta
+
+  if(tdelta < 0) stop("tdelta can't be negative")
+  if(abs(tdelta) > 3600) stop("tdelta is too large, consider not using this report")
+  if(tdelta != 0) {
+    n      <- nrow(dat)
+    tdelta <- -(tdelta / (n-1))
+    tdelta <- c(0, tdelta * (1:(n-1)))
+    dates2 <- dat$time + tdelta
+    reports[[i]]$dat$time <- dates2
+  }
+}
+```
+
+## trim start and end
+So that we exclude data not recorded in the field, or during logger manipulation.
+```{r trim}
+for(i in 1:length(reports)) {
+  dat <- reports[[i]]$dat
+  x   <- reports[[i]]$details
+  reports[[i]]$dat <- dat[dat$time >= as.POSIXct(x$start + 1) & dat$time <= as.POSIXct(x$end - 1),]
+}
+```
+
+## interpolate
+To match the standardized sampling rate of 1 reading every `r opt$samp_rate / 60` minutes.
+```{r interpolate1}
+for(i in 1:length(reports)) {
+  dat <- reports[[i]]$dat
+  x   <- reports[[i]]$details
+
+  t0 <- as.POSIXct(as.Date(head(dat$time, 1)))
+  t1 <- as.POSIXct(as.Date(tail(dat$time, 1))) + 3600 * 24 - 1
+  newDates <- seq.POSIXt(t0, t1, opt$samp_rate)
+  newTemps <- approx(dat$time, dat$temp, newDates, method = "linear", rule = 2)$y
+  reports[[i]]$dat <- tibble(time = newDates, temp = newTemps)
+}
+```
+```{r interpolate2, echo = FALSE}
+rm(list = setdiff(ls(), c("SERIALS", "MICROS", "SHORES", "REPORTS", "reports", "opt")))
+round(Sys.time() - .t1, 1)
+
+```
+
+## MERGE SERIALS
+Data from multiple reports for the same serial gets merged into a single thermal profile.
+```{r merge_serials}
+keep    <- c("serial1", "serial2", "shore1", "shore2", "ref2", "micro", "height", "exposure", "contacts", "factory_calib", "slope", "N", "ref1")
+SERIALS <- list()
+serials <- map_chr(reports, ~.x$details$serial2)
+for(s in unique(serials)) {
+  S <- which(serials == s)
+  if(length(S) == 1) {
+    tmp <- reports[[S]]
+    dat <- tmp$dat
+    tmp <- tmp$details[keep]
+  }else{
+    tmp <- reports[S]
+    dat <- do.call(rbind, purrr::map(tmp, "dat"))
+    tmp <- tmp[[1]]$details[keep]
+  }
+  tmp$bias <- 0
+  tmp$data <- dat
+  SERIALS[[s]] <- tmp
+}
+
+# convert to tibble
+x <- tibble(serial1  = map_chr(SERIALS, 1))
+n <- 2
+for(i in 1:7) {
+  x <- cbind(x, map_chr(SERIALS, n))
+  n <- n+1
+}
+for(i in 1:2) {
+  x <- cbind(x, map_lgl(SERIALS, n))
+  n <- n+1
+}
+for(i in 1:4) {
+  x <- cbind(x, map_dbl(SERIALS, n))
+  n <- n+1
+}
+colnames(x) <- c(keep, "bias")
+x <- as_tibble(x)
+x$data <- purrr::map(SERIALS, "data")
+
+# tidy
+colnames(x)[colnames(x) == "shore1"] <- "sh"
+colnames(x)[colnames(x) == "shore2"] <- "shore"
+x$exposure <- NULL
+x$sh_mic <- str_c(x$shore, "_", x$micro)
+x$start  <- purrr::map(x$data, ~.x$time %>% head(1)) %>% unlist %>% as.POSIXct(origin = origin)
+x$end    <- purrr::map(x$data, ~.x$time %>% tail(1)) %>% unlist %>% as.POSIXct(origin = origin)
+
+SERIALS <- x
+```
+
+## BIAS
+*This used to be a user guided procedure, but it is now automated.*  
+
+Even after applying the calibration correction, differences between temperatures recorded by loggers while underwater persist here and there. This should not be the case. Thus, an automated process is implemented where:  
+
+1. Temperatures recorded during high tide periods (tides with height above specific quantile values for each shore height, from 2010-2019 [a fixed time period is used to avoid changes in the tides selected upon addition of new data to the dataset]) are extracted  
+2. The reference water temperature for each shore is computed by averaging temperatures recorded by loggers during peak high tide
+3. Averaging is weighted, with loggers that have retained factory calibration being valued `r opt$bias_factory_calib_weight`x more than the remainder
+4. For each logger, its average bias to the reference water temperature readings is removed, resulting in an overall improved agreement regarding water temperatures throughout entire deployments
+
+### get tide data
+```{r get_tide}
+imported <- !opt$CLEAN_IMPORT & file.exists(opt$folders$imported_tides)
+if(imported) {
+	load(opt$folders$imported_tides)
+}else{
+	tides <- list()
+	
+	tspan  <- c("2010-01-01 00:00:01", "2019-12-31 23:59:59")
+	times <- tspan %>% 
+	  str_sub(1, 14) %>%
+	  str_c("00:00") %>%
+	  as.POSIXct
+	times <- seq.POSIXt(times[1], times[2], opt$samp_rate)
+	tspan  <- tspan %>%
+	  as.POSIXct %>%
+	  julian(origin = as.Date("1950-01-01")) %>%
+	  as.numeric %>%
+	  formatC(format = "f")
+	
+	# grab tides
+	for(i in 1:nrow(SHORES)) {
+		call <- str_c("export HDF5_DISABLE_VERSION_CHECK=2\nfes_slev", SHORES$lat[i], SHORES$lon[i], tspan[1], tspan[2], opt$samp_rate / 60, sep = " ")
+		# the expression "export HDF5_DISABLE_VERSION_CHECK=2\n" is inserted into the call because RS mac mini has a mismatch between the library and the header files; setting this in the system environmental variables does not work because R opens its own shell; the version mismatch does not appear to affect the tide data, but the gathering of tide data should, in the end, be run in another machine where this issue is not present
+		tid  <- system(call, intern = TRUE)[-(1:2)] %>%
+		  str_split(",")
+
+		tid <- tid %>%
+		  sapply("[[", 2) %>%
+		  as.numeric %>%
+		  xts(times)
+		
+		tmp <- data.frame(
+		  height = tid, 
+		  flag_hi = rollapply(zoo(tid), 5, function(x) which.max(x) == 3, fill = FALSE),
+		  flag_lo = rollapply(zoo(tid), 5, function(x) which.min(x) == 3, fill = FALSE))
+		TID <- list()
+		TID$tides   <- xts(tmp, time(tid))
+		TID$hi      <- tid[tmp$flag_hi]
+		tides[[i]] <- TID
+	}
+	
+	SHORES$tides    <- lapply(tides, "[[", "tides")
+	SHORES$hi       <- sapply(tides, "[[", "hi")
+  
+	tides <- SHORES
+	save(tides, file = opt$folders$imported_tides)
+}
+SHORES$tides <- tides$tides[match(tides$sh, SHORES$sh)]
+SHORES$hi    <- tides$hi[match(tides$sh, SHORES$sh)]
+```
+
+### get ref temps
+Reference temperatures are the weighted averages (based on factory calibration status) of logger temperatures recorded during high tide, representing the collective record of each shore's water temperature.  
+Loggers that retain factory calibration are worth `r opt$bias_factory_calib_weight`x more than the remaining loggers (`opt$bias_factory_calib_weight`).  
+
+1. Merge data for all loggers in each shore
+2. Filter data, only retaining recordings during high tide
+3. Do a weighted mean
+
+```{r ref_temp1}
+opt$ref_quantiles <- opt$ref_quantiles[opt$ref_quantiles != 1]
+
+pb <- txtProgressBar(max = nrow(SHORES), style = 3)
+PB <- 1
+TMP <- KEEP <- list()
+for(s in SHORES$sh) {
+  # grab data for this shore
+  dat <- SERIALS %>% filter(sh == s, micro %in% names(opt$ref_quantiles))
+  t0 <-  min(dat$start)
+  t1 <-  max(dat$end)
+  
+  # time stamps that encompass the entire date range of the data available for this shore
+  times <- seq.POSIXt(t0, t1, "hour")
+  
+  # empty xts with one column for each serial deployed in this shore
+  temps <- xts(matrix(NA, nrow = length(times), ncol = nrow(dat)), times)
+  colnames(temps) <- dat$serial1
+  
+  # tides higher that thresholds for each microhabitat, for this shore
+  thresh <- opt$ref_quantiles
+  tid <- filter(SHORES, sh == s)$hi[[1]]
+  for(i in 1:length(thresh)) thresh[[i]] <- quantile(tid, thresh[[i]])
+  for(i in 1:length(thresh)) thresh[[i]] <- time(tid[tid >= thresh[[i]]])
+  
+  # fill the xts with the available data
+  for(i in 1:nrow(dat)) {
+    tmp <- dat$data[[i]]
+    tmp <- tmp[tmp$time %in% thresh[[as.character(dat$micro[i])]],]
+    temps[as.character(tmp$time), i] <- tmp$temp
+  }
+  
+  # remove times without any data
+  temps <- temps[apply(coredata(temps), 1, function(x) !all(is.na(x))), ]
+  
+  # compute sd for all loggers within each height level
+  SDall <- apply(temps, 1, sd, na.rm = TRUE) <= opt$wat_max_sd
+  SDall[is.na(SDall)] <- FALSE
+  SDall <- which(SDall)
+  SD <- list()
+  for(h in unique(dat$height)) {
+    tmp <- temps[, dat$height == h]
+    tmp <- apply(tmp, 1, sd, na.rm = TRUE)
+    tmp <- tmp <= opt$ref_max_sd
+    tmp[is.na(tmp)] <- FALSE
+    tmp[SDall] <- TRUE
+    SD[[h]] <- tmp
+  }
+  
+  # if the sd test fails at lower shore levels, data from loggers higher in the shore also gets deleted
+  SD$mid[!SD$low] <- FALSE
+  SD$top[!SD$low | !SD$mid] <- FALSE
+  KEEP[[s]] <- SD
+
+  # remove data when sd is above opt$wat_max_sd
+  for(h in unique(dat$height)) temps[!SD[[h]], dat$height == h] <- NA
+
+  # find the factory calibration status of each logger, and use it to together with `opt$bias_factory_calib_weight` to inflate (or deflate) the relative value of recordings from loggers that retained factory calibration
+  yes_cal <- temps[,  dat$factory_calib] * opt$bias_factory_calib_weight
+  no__cal <- temps[, !dat$factory_calib]
+  
+  # find the number of loggers with data for each time stamp; n for the loggers with factory calibration must also be adjusted, so that the final average results in a proper value
+  n_yes_cal <- xts(apply(coredata(yes_cal), 1, function(x) sum(!is.na(x)) * opt$bias_factory_calib_weight), time(temps))
+  n_no__cal <- xts(apply(coredata(no__cal), 1, function(x) sum(!is.na(x))), time(temps))
+  
+  # combine weighted values of temperatures and n
+  vals <- cbind(yes_cal, no__cal) %>%
+    apply(1, sum, na.rm = TRUE)
+  n <- cbind(n_yes_cal, n_no__cal) %>%
+    apply(1, sum, na.rm = TRUE) %>%
+    coredata
+  
+  # vals / n is the weighted mean
+  TMP[[s]] <- xts(vals / n, time(temps))
+  
+  if(s == "sc") {
+    # for the plot in `ref_temp2`
+    tmp1 <- coredata(TMP[[s]])
+    tmp2 <- apply(coredata(temps), 1, mean, na.rm = TRUE)
+    tmp1 <- tibble(time = time(TMP[[s]]), val = as.numeric(tmp1 - tmp2))
+  }
+  setTxtProgressBar(pb, PB)
+  PB <- PB + 1
+}
+SHORES$water_ref <- TMP
+```
+```{r ref_temp2, echo = FALSE}
+ggplot(tmp1) + 
+  geom_line(aes(time, val)) +
+  geom_hline(aes(yintercept = 0), color = "red") +
+  labs(x = "", y = "", title = str_c("difference in the reference water temperature for South Cairn\nobtained using weighted  vs. unweighted mean")) +
+  theme_classic()
+```
+
+### fix average bias
+Compare water temperatures from each logger with the reference water temperature for their shore, compute the average bias and correct it.
+```{r fix_bias1}
+pb <- txtProgressBar(max = nrow(SERIALS), style = 3)
+for(i in 1:nrow(SERIALS)) {
+	x   <- SERIALS[i,]
+	if(str_sub(x$micro, 1, 1) == "s") {
+	  SERIALS$bias[i] <- 0
+	  next
+	}
+	sho <- x$sh
+	tid <- filter(SHORES, sh == sho)
+	ref <- tid$water_ref[[1]]
+	
+	tim <- KEEP[[as.character(sho)]][[as.character(x$height)]]
+	tim <- as.POSIXct(names(tim[tim]))
+	log <- x$data[[1]]
+	log <- log[log$time %in% tim, ]
+	log <- xts(log$temp, log$time)
+	
+	bias <- cbind(ref, log)
+	bias <- bias[complete.cases(bias),]
+	
+  # quality control
+	if(nrow(bias) < 10 | !nrow(log)) stop(str_c(sho, " ", x$height, " ", x$serial1, " ", nrow(bias), "\n"))
+
+	SERIALS$bias[i] <- mean(apply(bias, 1, function(x) x[1] - x[2]))
+
+	if(is.na(SERIALS$bias[i])) stop()
+	
+	SERIALS$data[[i]]$temp <- SERIALS$data[[i]]$temp + SERIALS$bias[i]
+	
+	if(i == 1) {
+	  # save for plotting
+	  LOG <- log
+	  REF <- ref
+	}
+	setTxtProgressBar(pb, i)
+}
+```
+```{r fix_bias2, echo = FALSE}
+round(Sys.time() - .t1, 1)
+
+
+LOG <- tibble(time = time(LOG), val = as.numeric(LOG))
+REF <- tibble(time = time(REF), val = as.numeric(REF))
+ggplot() +
+  geom_line(data = LOG, aes(time, val)) +
+  geom_line(data = REF, aes(time, val), color = "blue") +
+  labs(x = "", y = "", title = "example of bias correction (ref in blue)")
+
+ggplot(SERIALS, aes(start, bias)) + geom_bin2d(binwidth = c(3600 * 24 * 30, 0.1)) + labs(title = "bias correction magnitude for loggers over time")
+
+# compare with the old, manual bias correction
+old <- opt$bias_old
+new <- SERIALS %>% filter(serial2 %in% old$serial)
+old <- filter(old, serial %in% SERIALS$serial2)
+old <- old[match(new$serial2, old$serial), ]
+bias <- tibble(new = new$bias, old = old$bias)
+
+ggplot(bias, aes(new, old)) + 
+  geom_bin2d(binwidth = c(0.1,0.1)) + 
+  geom_hline(aes(yintercept = 0), size = 0.2) + 
+  geom_vline(aes(xintercept = 0), size = 0.2) + 
+  coord_cartesian(xlim = c(min(bias), max(bias)), ylim = c(min(bias), max(bias))) + 
+  labs(title = "new automated bias correction vs. old manual")
+
+rm(list = setdiff(ls(), c("SERIALS", "MICROS", "SHORES", "opt")))
+```
+
+# MERGE MICROS
+## combine serials
+Generate one xts for each of the `r nrow(MICROS)` combinations of shore & microhabitat, and compute the average and sd.
+```{r shore_micro}
+pb <- txtProgressBar(max = nrow(MICROS), style = 3)
+n <- n_distinct(MICROS$micro)
+
+dat <- list()
+keep <- rep(TRUE, nrow(MICROS))
+for(i in 1:nrow(MICROS)) {
+  tmp <- filter(SERIALS, sh_mic == MICROS$sh_mic[i])
+  if(!nrow(tmp)) {
+    keep[i] <- FALSE
+  }else{
+    if(nrow(tmp) == 1) {
+      dat[[i]] <- tmp$data[[1]]
+    }else{
+      tmp2 <- do.call(merge, purrr::map(tmp$data, ~xts(.x$temp, .x$time)))
+      tmp2 <- xts(data.frame(avg = round(apply(tmp2, 1, mean, na.rm = TRUE), 2), sd = round(apply(tmp2, 1, sd, na.rm = TRUE), 3)), time(tmp2))
+      tmp2 <- tibble(time = time(tmp2), avg = as.numeric(tmp2$avg), sd = as.numeric(tmp2$sd))
+      dat[[i]] <- tmp2
+    }
+  }
+  setTxtProgressBar(pb, i)
+}
+dat <- dat[keep]
+MICROS <- MICROS[keep, ]
+MICROS$data <- dat
+
+MICROS$start <- map_dbl(MICROS$data, ~head(.x$time, 1)) %>% as.POSIXct(origin = origin)
+MICROS$end   <- map_dbl(MICROS$data, ~tail(.x$time, 1)) %>% as.POSIXct(origin = origin)
+```
+
+## tide and light
+Add tide height, high and low tide flags, julian day, solar elevation and day/night data to each xts.
+```{r tide_and_day1}
+pb <- txtProgressBar(max = nrow(MICROS), style = 3)
+# tide height, high and low tide flags
+for(i in 1:nrow(MICROS)) {
+  sho <- MICROS$sh[i]
+  lat <- MICROS$lat[i]
+  lon <- MICROS$lon[i]
+  tim <- MICROS$data[[i]]$time
+  tid <- filter(SHORES, sh == sho)$tides[[1]][tim]
+  tid <- round(coredata(tid), 1)
+  MICROS$data[[i]] <- cbind(MICROS$data[[i]], tid) %>% as_tibble
+
+  # day of the year
+  MICROS$data[[i]]$jday <- yday(tim)
+  
+  # solar elevation and day/night
+  loc <- SpatialPoints(cbind(lon, lat), proj4string = CRS("+proj=longlat +datum=WGS84"))
+  elev <- round(solarpos(loc, tim)[,2], 1)
+  MICROS$data[[i]]$solar_elev <- ifelse(elev > 0, elev, 0)
+  
+  rises    <- sunriset(loc, tim, "sunrise", POSIXct.out = TRUE)[,2]
+  sets     <- sunriset(loc, tim, "sunset",  POSIXct.out = TRUE)[,2]
+  light    <- as.numeric(difftime(tim, rises, units = "secs")) > 0 & as.numeric(difftime(tim, sets, units = "secs")) < 0 
+  MICROS$data[[i]]$light <- light
+  setTxtProgressBar(pb, i)
+}
+```
+```{r tide_and_day2, echo = FALSE}
+round(Sys.time() - .t1, 1)
+
+
+tmp <- head(MICROS$data[[1]], 24 * 30)
+tmp$height <- (tmp$height / 100) + 9
+tmp$light2 <- (tmp$light * 3) + 2
+ggplot(tmp) + 
+  geom_line(aes(time, height), col = "blue") + 
+  geom_line(aes(time, light2), col = tmp$light + 1) + 
+  geom_line(aes(time, avg)) + labs(x = "", y = "")
+
+rm(list = setdiff(ls(), c("SERIALS", "MICROS", "SHORES", "opt")))
+```
+
+# WATER
+For each shore, grab logger data during high tide (i.e., shore water temperature).  
+This is a 2-step procedure:
+
+1. Water temperatures for each microhabitat are extracted and filtered to make sure that for each of the selected high tides we have enough logger readings, sd is within reasonable values, and that the height of the tides used takes into account the height level of the microhabitat (all high tides can be used for low shore loggers, while only the highest high tides should be used with top shore loggers)
+2. For each shore all available water temperature data is merged, only data for the lowest shore loggers is kept at any given moment (data for top shore logger will only be used if it is available and data for low and mid shore loggers is missing), and it is checked that for each high tide sd is not greater than `opt$wat_max_sd` (`r opt$wat_max_sd`)
+```{r water_temps1}
+opt$wat_quantiles <- opt$wat_quantiles[opt$wat_quantiles != 1]
+min_readings <- with(opt, tide_window * 3600 / samp_rate)
+twindow      <- (opt$samp_rate * (min_readings - 1)) / 2
+
+# grab water temperature for each microhabitat
+TMP <- list()
+for(i in 1:nrow(MICROS)) {
+  use <- MICROS$micro[i] %in% names(opt$wat_quantiles)
+  TMP[[i]] <- if(!use) {
+    NA
+  }else{
+    dat <- MICROS$data[[i]]
+    tid <- filter(SHORES, sh == MICROS$sh[i])$hi[[1]]
+    # filter tide data by 'wat_quantiles'
+    quant <- opt$wat_quantiles[[MICROS$micro[i]]]
+    tid <- tid[tid >= quantile(tid, quant)]
+    
+    dat$water <- cumsum(dat$flag_hi)
+    dat$water[dat$flag_hi == 0] <- NA
+    dat$water[!(dat$time %in% time(tid))] <- NA
+      
+    t <- dat$time[!is.na(dat$water)]
+    # sometimes high tide +- twindow includes times not available in dat$water
+    # therefore, those 't' must be stripped of those problematic timestamps
+    t0 <- t - twindow
+    T0 <- dat$time[dat$time %in% t0]
+    d0 <- setdiff(t0,T0)
+    if(length(d0)) for(d in d0) t <- t[-which(t == d + twindow)]
+    t1 <- t + twindow
+    T1 <- dat$time[dat$time %in% t1]
+    d1 <- setdiff(t1,T1)
+    if(length(d1)) for(d in d1) t <- t[-which(t == d - twindow)]
+    
+    # redo t0 and t1 because t may now be different
+    t0 <- t - twindow
+    t1 <- t + twindow
+  
+    dat$water[dat$time %in% t0] <- dat$water[dat$time %in% t]
+    dat$water[dat$time %in% t1] <- dat$water[dat$time %in% t]
+      
+    wat <- split(dat$avg, dat$water)
+    # filter by min_readings
+    wat <- wat[map_int(wat, length) == min_readings]
+    # filter by wat_max_sd (temporal stability)
+    good_sd <- map_dbl(wat, sd) <= opt$wat_max_sd
+    wat <- wat[good_sd]
+    t <- t[good_sd]
+    
+    # collapse to one value per high tide
+    val <- ceiling(min_readings / 2)
+    tibble(time = t, avg = map_dbl(wat, ~.x[val]))
+  }
+}
+MICROS$water <- TMP
+
+# merge water temperatures per shore
+TMP <- list()
+for(i in 1:nrow(SHORES)) {
+  sho <- SHORES$sh[i]
+  dat <- filter(MICROS, sh == sho)
+  dat <- dat[!is.na(dat$water),]
+  wat <- do.call(merge, purrr::map(dat$water, ~xts(.x$avg, .x$time)))
+  colnames(wat) <- dat$micro
+  
+  # data from loggers higher in the shore is only used if data from loggers lower in the shore is not available
+  # i.e., if low shore logger data are available, only those data are used
+  # if low shore logger data are missing and data from mid shore are available, then usse mid shore data
+  # top shore data is only used if there's no data from mid and low shore loggers, and opt$tid_quantile is different from 1
+  has_low <- apply(wat[,grepl("l", colnames(wat))], 1, function(x) !all(is.na(x)))
+  has_mid <- apply(wat[,grepl("m", colnames(wat))], 1, function(x) !all(is.na(x)))
+  wat[has_low | has_mid, grepl("t", colnames(wat))] <- NA
+  wat[has_low, grepl("m", colnames(wat))] <- NA
+
+  # summarise
+  y <- data.frame(
+    avg = round(apply(wat, 1, mean, na.rm = TRUE), 2), 
+    sd  = round(apply(wat, 1, sd,   na.rm = TRUE), 3))
+  y$sd[is.na(y$sd)] <- 0
+
+  # filter by wat_max_sd (agreement between microhabitats)
+  y <- y[y$sd <= opt$wat_max_sd, ]
+  y <- tibble(time = ymd_hms(rownames(y)), avg = y$avg, sd = y$sd)
+  
+  TMP[[i]] <- y
+
+  if(i == 1) {
+    Y <- y
+    WAT <- wat
+  }
+}
+SHORES$water <- TMP
+```
+```{r water_temps2, echo = FALSE}
+plot(Y$avg, main = "water temperatures for South Cairn", las = 1, xaxt = "n", type = "n")
+for(m in 1:ncol(WAT)) points(WAT[,m] %>% as.numeric, col = rainbow(ncol(WAT))[m], pch = 16, cex = 0.4)
+lines(Y$avg)
+```
+
+# FOR PLOTS
+```{r for_plots}
+pb <- txtProgressBar(max = nrow(MICROS), style = 3)
+X <- list()
+for(i in 1:nrow(MICROS)) {
+  x <- MICROS$data[[i]]
+  if(!any(colnames(x) == "avg")) colnames(x)[colnames(x) == "temp"] <- "avg"
+  y <- split.xts(xts(x$avg, x$time), "day") %>% purrr::map(~range(.x)) %>% do.call(rbind, .)
+  X[[i]] <- tibble(time = unique(as.Date(x$time)), min = y[,1], max = y[,2])
+  setTxtProgressBar(pb, i)
+}
+MICROS$daily <- X
+
+pb <- txtProgressBar(max = nrow(SHORES), style = 3)
+X <- list()
+for(i in 1:nrow(SHORES)) {
+  x <- SHORES$water[[i]]
+  y <- split.xts(xts(x$avg, x$time), "day") %>% purrr::map(~range(.x)) %>% do.call(rbind, .)
+  X[[i]] <- tibble(time = unique(as.Date(x$time)), min = y[,1], max = y[,2])
+  setTxtProgressBar(pb, i)
+}
+SHORES$daily <- X
+```
+
+# SAVE
+```{r save1}
+x <- list()
+x$serial <- SERIALS
+x$micro  <- MICROS
+x$shore  <- SHORES
+save(x, file = "RData/euro_output.RData")
+```
+```{r save2, echo = FALSE}
+round(Sys.time() - .t1, 1)
+
+```
